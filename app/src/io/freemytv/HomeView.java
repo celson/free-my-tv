@@ -139,7 +139,9 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     // At the top: tabs (0 to 2) and icon-only buttons (3 to 5); the three cards
     private int tab, topIndex, cardIndex;
     private int widgetIndex;    // with TalkBack on, the drawer's weather (0) or quotes (1) card can take the focus
-    private List<Recs.Pick> cards = new ArrayList<>();
+    private List<Recs.Pick> cards = new ArrayList<>();    // the three on screen: a page of cardsAll
+    private List<Recs.Pick> cardsAll = new ArrayList<>();   // this hour's picks for the tab
+    private int cardPage;
     // The three tabs, then the round buttons at the top right (up to HomeApps.MAX_TOP).
     private final Spring[] topFocus = new Spring[3 + HomeApps.MAX_TOP];
     private final RectF[] topRects = new RectF[3 + HomeApps.MAX_TOP];
@@ -2798,9 +2800,11 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
         heroDirty = statusDirty = true;
     }
 
-    /** The three cards of the current tab (Explore, Movies, Shows) and the background taken from the first one. */
+    /** The three cards on screen (a page of the tab's picks: Explore, Movies, Shows) and the background taken from the first one. */
     private void updateCards() {
-        List<Recs.Pick> list = recs.now(TAB_KIND[tab]);
+        cardsAll = recs.now(TAB_KIND[tab]);
+        cardPage = Math.min(cardPage, Math.max(0, (cardsAll.size() - 1) / 3));
+        List<Recs.Pick> list = new ArrayList<>(cardsAll.subList(cardPage * 3, Math.min(cardsAll.size(), cardPage * 3 + 3)));
         if (!samePicks(list, cards)) {
             cards = list;
             cardIndex = Math.min(cardIndex, Math.max(0, list.size() - 1));
@@ -2826,6 +2830,7 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
     private void selectTab(int index) {
         if (index == tab) return;
         tab = index;
+        cardPage = 0;
         updateCards();
         heroDirty = true;
     }
@@ -3054,7 +3059,15 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 }
                 break;
             case Z_CARDS:
-                if (dx != 0) {
+                if (dx > 0 && cardIndex == cards.size() - 1 && (cardPage + 1) * 3 < cardsAll.size()) {
+                    cardPage++;     // past the last card: the next three
+                    cardIndex = 0;
+                    updateCards();
+                } else if (dx < 0 && cardIndex == 0 && cardPage > 0) {
+                    cardPage--;
+                    updateCards();
+                    cardIndex = cards.size() - 1;
+                } else if (dx != 0) {
                     int next = Math.max(0, Math.min(cards.size() - 1, cardIndex + dx));
                     if (next == cardIndex) return true;
                     cardIndex = next;
