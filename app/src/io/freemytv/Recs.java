@@ -23,6 +23,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -36,7 +37,7 @@ import java.util.concurrent.Executors;
 /**
  * Home screen picks ("This morning / afternoon / tonight"): what's trending this week plus recent releases, only from
  * the streaming apps installed on the TV (Netflix, Prime Video, Disney+, Max, Apple TV, Okko, Hulu, Paramount+, Peacock,
- * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Three per hour.
+ * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Best rated first, the list renewed every hour.
  * "Watch" opens the service's app.
  *
  * Each person uses their own free TMDB key (config.properties "tmdb_key", built into the app). It never goes to the log.
@@ -47,6 +48,8 @@ final class Recs {
         String kind;            // "movie" or "tv"
         String title, backdrop, meta = "", app, pkg;
         String link;            // opens the title in its app (looked up with Watchmode), or null: the app's home
+        float score;            // TMDB's rating weighed by its votes (a title with few votes doesn't top the list)
+        boolean fresh;          // a recent release: the Movies and Shows tabs show only these
         boolean detailed;
         java.io.File photo;     // one of your own photos (Photos): no title, no caption
     }
@@ -58,10 +61,18 @@ final class Recs {
     private static final String IMAGES = "https://image.tmdb.org/t/p/" + (Backdrop.W <= 1280 ? "w1280" : "original");
     /** TMDB's Animation genre (movies and shows: cartoons and anime), left out with hide_animation=true. */
     private static final int ANIMATION = 16;
-    private static final long LIST_EVERY = 6 * 3600_000L;
+    private static final long LIST_EVERY = 3600_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
-    private static final int CACHE_VERSION = 4;
+    private static final int CACHE_VERSION = 6;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
+    /** Picks in each tab (the home screen shows them three at a time). */
+    private static final int PER_TAB = 20;
+    /** Backdrops kept ready in memory by the light design: every tab's first page and the pages around the one on screen. */
+    private static final int MEMORY_IMAGES = 18;
+    /** Original images kept on disk, so the whole list fits and an hourly renewal downloads only the new ones. */
+    private static final int DISK_IMAGES = 90;
+    /** The weighed rating (IMDb's formula): a title with few votes counts as an average one of this many. */
+    private static final double VOTES_WEIGHT = 500, AVERAGE_RATING = 6.5;
     /** Service name on TMDB (part of the name, lowercase) → TV app (HomeApps key, package). */
     private static final String[][] SERVICES = {
         {"netflix", "netflix", "com.netflix.ninja"},
@@ -119,7 +130,7 @@ final class Recs {
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
     private final List<Listener> listeners = new ArrayList<>();
-    private final Map<String, Backdrop> images = new LinkedHashMap<>();   // this hour's, built and ready to draw
+    private final Map<String, Backdrop> images = new LinkedHashMap<>(16, 0.75f, true);   // built and ready to draw; the least recently drawn goes first
     private final java.util.Set<String> pending = new java.util.HashSet<>();
     private volatile List<Pick> picks = new ArrayList<>();
     private volatile int period = -1;
@@ -185,28 +196,25 @@ final class Recs {
         return hour >= 5 && hour < 12 ? MANHA : hour >= 12 && hour < 18 ? TARDE : NOITE;
     }
 
-    /** This hour's picks (the first is the featured one; the arrows switch to the others). */
+    /** The picks for the first tab (Explore), best rated first. */
     List<Pick> now() {
         return now(null);
     }
 
-    /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
+    /**
+     * The tab's picks, best rated first and in that order all hour: the recent movies ("movie") or shows ("tv"); null =
+     * the best rated of both (Explore). Never two from the same franchise ("Law & Order" and "Law & Order: Special…").
+     */
     List<Pick> now(String kind) {
-        List<Pick> list = new ArrayList<>();
-        if (!hasKey(context)) return list;    // no TMDB key: no recommendations
-        Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
-        for (Pick p : picks) {
-            if ((kind == null || kind.equals(p.kind))
-                    && (!p.detailed || (p.pkg != null && have.computeIfAbsent(p.pkg, this::installed)))) list.add(p);   // app missing: skip
-        }
-        if (list.isEmpty()) return list;
-        long hour = System.currentTimeMillis() / 3600_000L;
-        // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
+        if (!hasKey(context)) return out;    // no TMDB key: no recommendations
+        Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
         java.util.Set<String> seen = new java.util.HashSet<>();
-        for (int i = 0; i < list.size() && out.size() < 3; i++) {
-            Pick p = list.get((int) ((hour * 3 + i) % list.size()));
+        for (Pick p : picks) {
+            if (kind != null && (!kind.equals(p.kind) || !p.fresh)) continue;
+            if (p.detailed && (p.pkg == null || !have.computeIfAbsent(p.pkg, this::installed))) continue;   // app missing: skip
             if (seen.add(franchise(p.title))) out.add(p);
+            if (out.size() >= PER_TAB) break;
         }
         return out;
     }
@@ -407,8 +415,8 @@ final class Recs {
         if (services.isEmpty()) throw new IOException(NO_APPS);
         StringBuilder ids = new StringBuilder();
         for (int id : services.keySet()) ids.append(ids.length() == 0 ? "" : "|").append(id);
-        String common = "&language=" + lang() + "&watch_region=" + REGION + "&with_watch_monetization_types=flatrate&include_adult=false"
-                + "&sort_by=popularity.desc&with_watch_providers=" + URLEncoder.encode(ids.toString(), "UTF-8")
+        String base = "&language=" + lang() + "&watch_region=" + REGION + "&with_watch_monetization_types=flatrate&include_adult=false"
+                + "&with_watch_providers=" + URLEncoder.encode(ids.toString(), "UTF-8")
                 + (Config.HIDE_ANIMATION ? "&without_genres=" + ANIMATION : "");
         // 1. Trending this week (TMDB goes by what people are watching and searching for right now), only what is
         //    on one of the TV's services: the details say where (and are then ready).
@@ -428,18 +436,48 @@ final class Recs {
         }
         // 2. Recent releases on the TV's services: movies from the past year and shows with a new episode in the
         //    past 3 months.
-        JSONArray movies = get("/discover/movie?vote_count.gte=30&primary_release_date.gte=" + day(-365)
-                + "&primary_release_date.lte=" + day(0) + common).getJSONArray("results");
-        JSONArray shows = get("/discover/tv?vote_count.gte=20&air_date.gte=" + day(-90) + "&air_date.lte=" + day(0)
-                + common).getJSONArray("results");
+        JSONArray movies = get("/discover/movie?vote_count.gte=100&primary_release_date.gte=" + day(-365)
+                + "&primary_release_date.lte=" + day(0) + base + "&sort_by=vote_average.desc").getJSONArray("results");
+        JSONArray shows = get("/discover/tv?vote_count.gte=50&air_date.gte=" + day(-90) + "&air_date.lte=" + day(0)
+                + base + "&sort_by=vote_average.desc").getJSONArray("results");
         List<Pick> newMovies = new ArrayList<>(), newShows = new ArrayList<>();
         for (int i = 0; i < movies.length(); i++) add(newMovies, movies.getJSONObject(i), "movie");
         for (int i = 0; i < shows.length(); i++) add(newShows, shows.getJSONObject(i), "tv");
-        // Trending first, then the new releases; movies and shows alternating, without repeats, up to 24.
+        // 3. The best rated on the TV's services, with enough votes for the rating to mean something.
+        JSONArray bestOfMovies = get("/discover/movie?vote_count.gte=1000&sort_by=vote_average.desc" + base).getJSONArray("results");
+        JSONArray bestOfShows = get("/discover/tv?vote_count.gte=500&sort_by=vote_average.desc" + base).getJSONArray("results");
+        List<Pick> bestMovies = new ArrayList<>(), bestShows = new ArrayList<>();
+        for (int i = 0; i < bestOfMovies.length(); i++) add(bestMovies, bestOfMovies.getJSONObject(i), "movie");
+        for (int i = 0; i < bestOfShows.length(); i++) add(bestShows, bestOfShows.getJSONObject(i), "tv");
+        // Details already known (the same list an hour ago) aren't asked for again.
+        Map<String, Pick> known = new HashMap<>();
+        if (listLanguage.equals(Ui.language)) {
+            for (Pick old : picks) if (old.detailed && old.pkg != null && installed(old.pkg)) known.put(key(old), old);
+        }
+        // Everything found, best rated first: the top PER_TAB of each kind for Explore, and every recent release for the
+        // Movies and Shows tabs (a trending title that is also a recent release counts as one).
+        java.util.Set<String> fresh = new java.util.HashSet<>();
+        for (Pick pick : newMovies) fresh.add(key(pick));
+        for (Pick pick : newShows) fresh.add(key(pick));
         List<Pick> list = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
-        alternate(list, seen, hotMovies, hotShows, 24);
-        alternate(list, seen, newMovies, newShows, 24);
+        for (List<List<Pick>> kind : java.util.Arrays.asList(java.util.Arrays.asList(hotMovies, newMovies, bestMovies),
+                java.util.Arrays.asList(hotShows, newShows, bestShows))) {
+            List<Pick> ofKind = new ArrayList<>();
+            for (List<Pick> source : kind) {
+                for (Pick pick : source) {
+                    if (!seen.add(key(pick))) continue;
+                    Pick old = known.get(key(pick));
+                    Pick use = old != null ? old : pick;
+                    use.score = pick.score;
+                    use.fresh = fresh.contains(key(pick));
+                    ofKind.add(use);
+                }
+            }
+            Collections.sort(ofKind, (x, y) -> Float.compare(y.score, x.score));
+            for (int i = 0; i < ofKind.size(); i++) if (i < PER_TAB || ofKind.get(i).fresh) list.add(ofKind.get(i));
+        }
+        Collections.sort(list, (x, y) -> Float.compare(y.score, x.score));
         if (list.isEmpty()) throw new IOException("TMDB returned no recommendations");
         picks = list;
         period = p;
@@ -458,13 +496,6 @@ final class Recs {
         return lang + "-" + Ui.locale().getCountry();
     }
 
-    private static void alternate(List<Pick> out, java.util.Set<String> seen, List<Pick> a, List<Pick> b, int max) {
-        for (int i = 0; i < Math.max(a.size(), b.size()) && out.size() < max; i++) {
-            if (i < a.size() && seen.add(key(a.get(i)))) out.add(a.get(i));
-            if (i < b.size() && out.size() < max && seen.add(key(b.get(i)))) out.add(b.get(i));
-        }
-    }
-
     /** The date `offset` days from today, as "2026-10-19" (negative = in the past). */
     private static String day(int offset) {
         Calendar cal = Calendar.getInstance();
@@ -481,6 +512,8 @@ final class Recs {
         p.kind = kind;
         p.title = o.optString(kind.equals("movie") ? "title" : "name");
         p.backdrop = backdrop;
+        double votes = o.optDouble("vote_count", 0);
+        p.score = (float) ((votes * o.optDouble("vote_average", 0) + VOTES_WEIGHT * AVERAGE_RATING) / (votes + VOTES_WEIGHT));
         list.add(p);
     }
 
@@ -586,7 +619,9 @@ final class Recs {
         String n = name.toLowerCase(Locale.ROOT);
         String[] first = null;
         // "HBO Max Amazon Channel", "Apple TV Amazon Channel"...: a subscription sold inside another app, not this one.
-        if (n.contains(" channel")) return null;
+        // Apple TV+ bought through Prime Video (apple_on_prime) is Prime Video's to open.
+        if (Config.APPLE_ON_PRIME && n.contains("apple tv") && n.contains("amazon channel")) n = "prime video";
+        else if (n.contains(" channel")) return null;
         for (String[] s : SERVICES) {
             // Apple TV: only the streaming service (TMDB provider 350); provider 2 is the Apple TV Store (rent or buy).
             if (s[1].equals("appletv") && providerId != 350) continue;
@@ -613,7 +648,8 @@ final class Recs {
     }
 
     private long sourceStamp() {
-        long stamp = (Config.TMDB_KEY.hashCode() * 31L + REGION.hashCode()) * 31L + (Config.HIDE_ANIMATION ? 1 : 0);
+        long stamp = (Config.TMDB_KEY.hashCode() * 31L + REGION.hashCode()) * 31L + (Config.HIDE_ANIMATION ? 1 : 0)
+                + (Config.APPLE_ON_PRIME ? 2 : 0);
         for (String[] service : SERVICES) stamp = stamp * 31L + (installed(service[2]) ? service[2].hashCode() : 0);
         return stamp;
     }
@@ -710,7 +746,7 @@ final class Recs {
         return key.isEmpty() ? null : key;
     }
 
-    // MARK: - Images (TMDB originals on disk, up to 24 so the whole list fits; this hour's kept ready in memory)
+    // MARK: - Images (TMDB originals on disk, so the whole list fits; the ones on screen kept ready in memory)
 
     private void download(Pick p) throws IOException {
         File f = imageFile(p);
@@ -758,7 +794,7 @@ final class Recs {
             if (forLight != light) return;   // the design changed midway: this one is stale
             synchronized (images) {
                 images.put(p.backdrop, backdrop);
-                while (images.size() > (forLight ? 10 : 4)) images.remove(images.keySet().iterator().next());
+                while (images.size() > (forLight ? MEMORY_IMAGES : 4)) images.remove(images.keySet().iterator().next());
             }
             notifyListeners();
         } catch (IOException | RuntimeException | OutOfMemoryError e) {
@@ -771,7 +807,7 @@ final class Recs {
     void trim() {
         // Explore's picks stay: the home screen opens on that tab, so its cards are never gray when you come back.
         java.util.Set<String> keep = new java.util.HashSet<>();
-        for (Pick p : now(null)) if (p.backdrop != null) keep.add(p.backdrop);
+        for (Pick p : now(null).subList(0, Math.min(3, now(null).size()))) if (p.backdrop != null) keep.add(p.backdrop);
         synchronized (images) {
             images.keySet().retainAll(keep);
         }
@@ -786,9 +822,9 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= 24) return;
+        if (files == null || files.length <= DISK_IMAGES) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - 24; i++) {
+        for (int i = 0; i < files.length - DISK_IMAGES; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }
@@ -802,7 +838,7 @@ final class Recs {
             for (Pick p : picks) {
                 a.put(new JSONObject().put("id", p.id).put("kind", p.kind).put("title", p.title).put("backdrop", p.backdrop).put("link", p.link == null ? "" : p.link)
                         .put("meta", p.meta).put("app", p.app == null ? "" : p.app).put("pkg", p.pkg == null ? "" : p.pkg)
-                        .put("detailed", p.detailed));
+                        .put("detailed", p.detailed).put("score", p.score).put("fresh", p.fresh));
             }
             SharedPreferences.Editor e = cache.edit().putString("picks", a.toString()).putInt("period", period).putLong("listAt", listAt)
                     .putString("language", listLanguage)
@@ -831,6 +867,8 @@ final class Recs {
             p.app = o.optString("app").isEmpty() ? null : o.optString("app");
             p.pkg = o.optString("pkg").isEmpty() ? null : o.optString("pkg");
             p.detailed = o.optBoolean("detailed");
+            p.score = (float) o.optDouble("score", 0);
+            p.fresh = o.optBoolean("fresh");
             out.add(p);
         }
         return out;
