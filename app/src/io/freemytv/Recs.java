@@ -657,7 +657,7 @@ final class Recs {
     // MARK: - Watchmode (the title's own page in its app; the free plan's web addresses are what the apps open)
 
     private static String linkKey(Pick p) {
-        return "wm:" + p.kind + p.id + p.app + (Config.APPLE_ON_PRIME ? "+" : "");   // apple_on_prime changes what is looked up
+        return "wm:" + p.kind + p.id + p.app + "v2" + (Config.APPLE_ON_PRIME ? "+" : "");   // apple_on_prime changes what is looked up
     }
 
     private boolean needsLink(Pick p) {
@@ -696,6 +696,12 @@ final class Recs {
                     // Apple TV+ bought through Prime Video ("AppleTV+ Amazon Channel"): its link is Prime Video's own.
                     if (Config.APPLE_ON_PRIME && service[1].equals("prime")) same |= name.contains("appletv") && name.contains("amazonchannel");
                     if (same && s.optString("type").equals("sub") && s.optString("web_url").startsWith("https://")) link = s.optString("web_url");
+                }
+                // Prime Video sells other services as channels ("Crunchyroll (Via Prime)"): when it has no source of its own,
+                // a channel's link is still Prime Video's page for the title.
+                for (int i = 0; service != null && service[1].equals("prime") && i < sources.length() && link.isEmpty(); i++) {
+                    JSONObject s = sources.getJSONObject(i);
+                    if (s.optString("type").equals("sub") && s.optString("web_url").startsWith("https://app.primevideo.com/")) link = s.optString("web_url");
                 }
             }
             cache.edit().putString(linkKey(p), link).apply();
