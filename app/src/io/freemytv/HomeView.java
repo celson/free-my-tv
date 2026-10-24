@@ -2813,7 +2813,13 @@ final class HomeView extends ViewGroup implements Choreographer.FrameCallback, H
                 retarget(false);
             }
         }
-        for (Recs.Pick p : recs.wanted()) recs.backdrop(p);   // all three tabs preloaded: switching tabs is instant
+        // Ready before they are needed: each tab's first page (switching tabs is instant) and the pages around this one.
+        for (int t = 0; t < 3; t++) {
+            if (t == tab) continue;
+            List<Recs.Pick> other = recs.now(TAB_KIND[t]);
+            for (int i = 0; i < Math.min(3, other.size()); i++) recs.backdrop(other.get(i));
+        }
+        for (int i = Math.max(0, (cardPage - 1) * 3); i < Math.min(cardsAll.size(), (cardPage + 2) * 3); i++) recs.backdrop(cardsAll.get(i));
         // Picks bring their own background; without them (no TMDB key), your photo if there is one.
         boolean own = !picksOn() && Photos.on(getContext());
         Backdrop b = own ? Photos.backdrop(getContext(), ownReady) : cards.isEmpty() ? null : recs.backdrop(cards.get(0));
