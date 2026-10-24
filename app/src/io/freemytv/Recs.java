@@ -657,7 +657,7 @@ final class Recs {
     // MARK: - Watchmode (the title's own page in its app; the free plan's web addresses are what the apps open)
 
     private static String linkKey(Pick p) {
-        return "wm:" + p.kind + p.id + p.app;
+        return "wm:" + p.kind + p.id + p.app + (Config.APPLE_ON_PRIME ? "+" : "");   // apple_on_prime changes what is looked up
     }
 
     private boolean needsLink(Pick p) {
@@ -693,6 +693,8 @@ final class Recs {
                     String name = s.optString("name").toLowerCase(Locale.ROOT).replace(" ", "");
                     String want = service[0].replace(" ", "");
                     boolean same = want.equals("max") ? name.equals("max") : name.contains(want);
+                    // Apple TV+ bought through Prime Video ("AppleTV+ Amazon Channel"): its link is Prime Video's own.
+                    if (Config.APPLE_ON_PRIME && service[1].equals("prime")) same |= name.contains("appletv") && name.contains("amazonchannel");
                     if (same && s.optString("type").equals("sub") && s.optString("web_url").startsWith("https://")) link = s.optString("web_url");
                 }
             }
